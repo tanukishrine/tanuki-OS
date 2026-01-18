@@ -1,14 +1,29 @@
 BITS 16
-org 0x7e00
+org 0x0500
 
-; bp = PSP (parameter stack pointer) ; sp = RSP (return stack pointer) ; FORTH MACROS
-%macro	pspush	1	; src
+; bp = PSP (parameter stack pointer)
+; sp = RSP (return stack pointer) ; FORTH MACROS
+
+; USEFUL MACROS
+
+%macro	spush 1 ; src
 	sub	bp, 2
 	mov	word [bp], %1
 %endmacro
-%macro	pspop	1	; dst
+
+%macro	spop 1 ; dst
 	mov	word %1, [bp]
 	add	bp, 2
+%endmacro
+
+%macro	litb	1
+	mov	byte [di], %1
+	inc	di
+%endmacro
+
+%macro	litw	1
+	mov	word [di], %1
+	add	di, 2
 %endmacro
 
 ; WORD STRUCTURE
@@ -19,7 +34,7 @@ org 0x7e00
 	db	%2	; len  (1 byte)
 	%push dict
 	%$link:
-%endmacro		; load (n bytes)
+%endmacro
 
 %macro wordlink 2
 	db	%1	; name (n bytes)
@@ -30,14 +45,14 @@ org 0x7e00
 	%$link:
 %endmacro		; load (n bytes)
 
-%macro wordlast 2
-	db	%1	; name (n bytes)
-	dw	%$link	; link (2 bytes)
-	db	%2	; len  (1 byte)
-%endmacro		; load (n bytes)
+%define FLAG_IMMEDIATE	0x80	; immediate flag
+%define MASK_LENGTH	0x7f	; namelen mask
 
-%define	FLAG_IMMEDIATE	0x80	; immediate flag
-%define	MASK_LENGTH	0x7f	; namelen mask
+%macro	const 3 ; name, len, lit
+	wordlink %1, %2
+	spush	%3
+	ret
+%endmacro
 
 start:		mov	bp, 0xff00	; initialize SP
 		mov	sp, 0x0000	; initialize RS
@@ -45,67 +60,50 @@ start:		mov	bp, 0xff00	; initialize SP
 
 ; SYSTEM VARIABLES
 
-state:		db 0
+state:		db 0	; interpret or compile mode
 
-latest:		dw nop
-here:		dw end
+latest:		dw noop	; last word of the dictionary
+here:		dw end	; next available space in dictionary
 
-in:		dw buffer
-buffer:		times 65 db 0
+in:		dw buffer	; current char read in buffer
+buffer:		times 65 db 0	; input buffer
 
-curchar:	dw buffer
-curlen:		db 0
+curchar:	dw 0	; current word addr
+curlen:		db 0	; current word len
 
-blk:		dw 0x0500	; start of source
-
+blk:		dw 0x7e00	; start of source
 
 ; DICTIONARY
-
 		; key ( -- c )
 		; fetch char c from direct input
-
 		wordinit 'key', 3
-
 key:		mov	ah, 0x00
 		int	0x16
-		xor	ah, ah
-		pspush	ax
+		spush	ax	; ah: scan code, al: ascii char
 		ret
-
 
 		; emit ( c -- )
 		; spit char c to output stream
-
 		wordlink 'emit', 4
-
-emit:		pspop	ax
+emit:		spop	ax
 		mov	ah, 0x0e
 		int	0x10
 		ret
 
-
 		; abort ( -- )
 		; reset PS and jump to quit
-
 		wordlink 'abort', 5
-
 abort:		mov	bp, 0xff00
 		jmp	quit
 
-
 		; quit ( -- )
-		; reset RS, clear the buffer,
-		; set state to immediate mode,
-		; jump to interpret loop
-
+		; reset RS and return to interpreter prompt
 		wordlink 'quit', 4
-
 quit:		mov	sp, 0x0000
-		mov	[state], 0	; interpret mode
-		mov	word [blk], 0	; input from user
-		mov	[in], buffer+64	; initialize rdln
+		mov	byte [state], 0
+		mov	word [blk], 0
+		mov	word [in], buffer+64
 		jmp	interpret
-
 
 		; interpret ( -- )
 		; main interpret loop
@@ -116,33 +114,25 @@ interpret:	; read next word
 
 		; is a number?
 		call	parse		; ( sa sl -- n? f )
-		pspop	ax		; ( n? f -- n? )
+		spop	ax		; ( n? f -- n? )
 		test	ax, ax
 		jnz	.num
 
 		; is a word?
 		call	curword		; ( -- sa sl )
 		call	find		; ( sa sl -- w? f )
-		pspop	ax		; ( w? f -- w? )
+		spop	ax		; ( w? f -- w? )
 		test	ax, ax
 		jnz	.word
 
 		; not a word
-		call	nl_out		; ( -- )
-		call	curword		; ( -- sa sl )
-		call	stype		; ( sa sl -- )
-		pspush	.err		; ( -- sa )
-		pspush	15		; ( -- sa sl )
-		call	stype		; ( sa sl -- )
-		jmp	abort
+		jmp	notfound
 
-	.err:	db ' word not found'
-
-	.num:	mov	al, [state]
+	.num:	mov	al, [state]	; ( n -- n )
 		test	al, al
 		jz	interpret
 
-		call	litn
+		call	litn		; ( n -- )
 		jmp	interpret
 
 	.word:	mov	al, [state]
@@ -156,70 +146,78 @@ interpret:	; read next word
 		test	al, al
 		jnz	.run
 
-		call	compile_comma
-		jmp	interpret
+		call	compile_comma	; ( w -- )
+		jmp	interpret	; ( -- )
 
-	.run:	call	execute
-		jmp	interpret
+	.run:	call	execute		; ( w -- )
+		jmp	interpret	; ( -- )
 
+notfound:	call	nl_out		; ( -- )
+		call	curword		; ( -- sa sl )
+		call	type		; ( sa sl -- )
+		spush	.err		; ( -- sa )
+		spush	15		; ( -- sa sl )
+		call	type		; ( sa sl -- )
+		jmp	abort
 
-		; stype ( sa sl -- )
+	.err:	db ' word not found'
+
+underflow:	spush	.err		; ( -- sa )
+		spush	21		; ( -- sa sl )
+		call	type		; ( sa sl -- )
+		jmp	abort
+
+	.err:	db 0x0d, 0x0a, 'stack out of bounds'
+
+		; type ( sa sl -- )
 		; emit all chars of string
-
-		wordlink 'stype', 5
-stype:		pspop	cx
-		pspop	si
+		wordlink 'type', 4
+type:		spop	cx
+		spop	si
 		mov	ah, 0x0e
 	.next:	lodsb
 		int	0x10
 		loop	.next
 		ret
 
-
 		; word ( -- sa sl )
 		; read one word from buffered input
 		; update curchar and curlen
-
 		wordlink 'word', 4
 toword:		call	tochar
-		pspop	ax
+		spop	ax
 		cmp	ax, 0x20
 		jbe	toword
 		mov	ax, [in]
 		dec	ax
-		pspush	ax
+		spush	ax
 		mov	[curchar], ax
 		xor	cx, cx
 
 	.next:	inc	cx
 		call	tochar
-		pspop	ax
+		spop	ax
 		cmp	ax, 0x20
 		ja	.next
 
-		pspush	cx
+		spush	cx
 		mov	[curlen], cl
 		ret
 
 		; curword ( -- sa sl )
 		; yield the last read word
-
 		wordlink 'curword', 7
-
 curword:	mov	ax, [curchar]
-		pspush	ax
+		spush	ax
 		mov	al, [curlen]
 		xor	ah, ah
-		pspush	ax
+		spush	ax
 		ret
-
 
 		; in< ( -- c )
 		; read one char from buffered input
-		; if end of input, read new line
-
+		; if end of line, read new line
 		wordlink 'in<', 3
-
 tochar:		mov	bx, [in]
 		cmp	bx, buffer+64
 		jbe	.skip
@@ -227,16 +225,19 @@ tochar:		mov	bx, [in]
 		mov	bx, buffer
 	.skip:	mov	al, [bx]
 		xor	ah, ah
-		pspush	ax
+		spush	ax
 		inc	bx
 		mov	[in], bx
 		ret
 
-
 		; ln< ( -- )
 		; routine that feeds lines to the interpreter
 		wordlink 'ln<', 3
-ln_in:		mov	ax, [blk]
+ln_in:		call	scnt
+		spop	ax
+		test	ax, ax
+		js	underflow
+		mov	ax, [blk]
 		test	ax, ax
 		jz	rdln
 		jmp	rdbln
@@ -247,69 +248,57 @@ rdbln:		mov	si, [blk]
 		mov	di, buffer
 		mov	cx, 64
 		rep	movsb
-		mov	al, 0
-		stosb
+		litb	0
 		mov	word [blk], si
-		mov	[in], buffer
+		mov	word [in], buffer
 		ret
 
 		; rdln ( -- )
 		; feed a line to the buffered input
-
 		wordlink 'rdln', 4
-
-rdln:		pspush	.ok
-		pspush	5
-		call	stype
-
+rdln:		spush	.ok
+		spush	5
+		call	type
 		mov	di, buffer
 
 	.next	cmp	di, buffer+64	; buffer full?
 		je	.cr		; submit
-
-		call	key
-		pspop	ax
-
-		cmp	al, 0x0d
+		mov	ah, 0x00	; call key
+		int	0x16
+		cmp	al, 0x0d	; submit?
 		je	.cr
-
-		cmp	al, 0x08
+		cmp	al, 0x08	; backspace?
 		je	.bs
-
 		cmp	al, 0x20	; control character?
 		jb	.next		; do nothing
 
 		stosb			; store string byte
-		pspush	ax
-		call	emit
+		mov	ah, 0x0e	; emit char
+		int	0x10
 		jmp	.next
 
 	.bs:	cmp	di, buffer	; empty buffer?
 		je	.next		; do nothing
-
-		dec	di		; clear previous character
+		dec	di		; clear previous char
 		mov	byte [di], 0
 		call	bs_out
 		jmp	.next
 
-	.cr:	call	spc_out		; QOL visual
-		xor	al, al		; flush rest of line with null
+	.cr:	call	spc_out		; emit space after enter
+		xor	al, al		; flush rest of line
 	.null:	stosb			
 		cmp	di, buffer+64
 		jbe	.null
-		mov	[in], buffer	; reset input ptr
+		mov	word [in], buffer
 		ret
 
-	.ok	db ' ok', 13, 10
-
+	.ok	db ' ok', 0x0d, 0x0a ; CR, LF
 
 		; parse ( sa sl -- n? f )
 		; convert string as a number
-
 		wordlink 'parse', 5
-
-parse:		pspop	cx
-		pspop	si
+parse:		spop	cx
+		spop	si
 		xor	ax, ax	; current char
 		xor	bx, bx	; result
 
@@ -327,39 +316,30 @@ parse:		pspop	cx
 		; character literal
 	.char:	cmp	cx, 2
 		jne	.nan
-
 		lodsb
 		mov	bl, al
 		lodsb
 		cmp	al, "'"
 		jne	.nan
-
 		jmp	.num
 
 		; hexadecimal
 	.hex:	lodsb
 		shl	bx, 4		; multiply by 16
-
 		cmp	al, '0'
 		jb	.nan
 		cmp	al, '9'
 		jbe	.digit
-
 		cmp	al, 'a'
 		jb	.nan
 		cmp	al, 'f'
 		jbe	.alpha
-
 		jmp	.nan
-
-	.digit:	sub	al, '0'
+	.digit: sub	al, '0'
 		jmp	.add
-
-	.alpha:	sub	al, 'a'-10
-
+	.alpha: sub	al, 'a'-10
 	.add:	add	bx, ax
 		loop	.hex
-
 		jmp	.num
 
 		; negative decimal
@@ -383,48 +363,41 @@ parse:		pspop	cx
 		add	bx, ax
 		loop	.pos
 
-	.num:	pspush	bx
-		pspush	-1
+	.num:	spush	bx
+		spush	-1
 		ret
 
-	.nan:	pspush	0
+	.nan:	spush	0
 		ret
-
 
 		; lit ( -- n ) runtime
-
+		wordlink 'lit', 3
 lit:		pop	si
 		lodsw
-		pspush	ax
+		spush	ax
 		push	si
 		ret
 
 
 		; litn ( n -- )
-		; write n as a literal
-
+		; compile n as a literal
 		wordlink 'litn', 4
-
-litn:		mov	al, 0xe8	; call opcode
-		mov	di, [here]
-		stosb
-
+litn:		mov	di, [here]
+		litb	0xe8
 		mov	ax, lit		; relative addressing
 		sub	ax, di
 		sub	ax, 2
 		stosw
-
-		pspop	ax		; store n
+		spop	ax		; store n
 		stosw
-
 		mov	[here], di
 		ret
 
-
 		; find ( sa sl -- w? f )
+		; search for counted string in dictionary
 		wordlink 'find', 4
-find:		pspop	ax		; len
-		pspop	dx		; addr
+find:		spop	ax		; len
+		spop	dx		; addr
 		mov	bx, [latest]	; curr
 
 	.loop:	mov	cl, [bx-1]	; same length?
@@ -444,49 +417,37 @@ find:		pspop	ax		; len
 		cmp	bx, 0
 		jnz	.loop
 
-		pspush	0
+		spush	0
 		ret
 
-	.found:	pspush	bx
-		pspush	-1
+	.found: spush	bx
+		spush	-1
 		ret
-
 
 		; execute ( w -- )
-		; jump IP to addr w
-
+		; jump to addr w
 		wordlink 'execute', 7
-
-execute:	pspop	ax
+execute:	spop	ax
 		jmp	ax
-
 
 		; compile, ( w -- )
 		; append a call to wordref w to here
-
 		wordlink 'compile,', 8
-
-compile_comma:	mov	al, 0xe8 ; call opcode
-		mov	di, [here]
-		stosb
-
-		pspop	ax ; wordref
+compile_comma:	mov	di, [here]
+		litb	0xe8 ; call opcode
+		spop	ax ; wordref
 		sub	ax, di
 		sub	ax, 2
 		stosw
-
 		mov	[here], di
 		ret
 
-
 		; header ( sa sl -- )
 		; append a new header with name s
-
 		wordlink 'header', 6
-
-header:		pspop	bx
+header:		spop	bx
 		mov	cx, bx
-		pspop	si
+		spop	si
 		mov	di, [here]
 		rep	movsb
 		mov	ax, [latest]
@@ -497,12 +458,9 @@ header:		pspop	bx
 		mov	[here], di
 		ret
 
-
 		; create x ( -- )
 		; append a new header with name x
-
 		wordlink 'create', 6
-
 create:		call	toword		; ( -- sa sl )
 		call	header		; ( sa sl -- )
 		ret
@@ -517,39 +475,28 @@ immediate:	mov	bx, [latest]
 		mov	[bx], al
 		ret
 
-
 		; [ ( -- ) IMMEDIATE
 		; to immediate mode
-
 		wordlink '[', 1 | FLAG_IMMEDIATE
-
 to_immediate:	mov	byte [state], 0
 		ret
 
-
 		; ] ( -- )
 		; to compile mode
-
 		wordlink ']', 1
-
 to_compile:	mov	byte [state], -1
 		ret
 
-
 		; exit ( -- )
 		; compile exit from a word
-
-		wordlink 'exit', 4
-
-exit:		mov	al, 0xc3 ; ret
-		mov	di, [here]
-		stosb
+		wordlink 'exit', 4 | FLAG_IMMEDIATE
+exit:		mov	di, [here]
+		litb	0xc3 ; ret
 		mov	[here], di
 		ret
 
-		; : x ( -- )
-		; create a new word definition with name x
-
+		; : ... ( -- )
+		; create a new word definition with name ...
 		wordlink ':', 1
 colon:		call	create
 		call	to_compile
@@ -557,48 +504,37 @@ colon:		call	create
 
 		; ; ( -- )
 		; end current word definition
-
 		wordlink ';', 1 | FLAG_IMMEDIATE
 semicolon:	call	exit
 		call	to_immediate
 		ret
 
-
-		; spc> ( -- ) emit space character
-
+		; spc> ( -- )
+		; emit space character
 		wordlink 'spc>', 4
-
-spc_out:	pspush	0x20 ; SP
+spc_out:	spush	0x20 ; SP
 		call	emit
 		ret
 
-
-		; nl> ( -- ) emit newline
-	
+		; nl> ( -- )
+		; emit newline
 		wordlink 'nl>', 3
-
-nl_out:		pspush	.nl
-		pspush	2
-		call	stype
+nl_out:		spush	.nl
+		spush	2
+		call	type
 		ret
 
-		; CR, LF
-	.nl:	db 0x0d, 0x0a
-
+	.nl:	db 0x0d, 0x0a ; CR, LF
 
 		; bs> ( -- )
 		; delete prev char in TTY mode
-
 		wordlink 'bs>', 3
-
-bs_out:		pspush	.bs
-		pspush	3
-		call	stype
+bs_out:		spush	.bs
+		spush	3
+		call	type
 		ret
 
-		; BS, SPC, BS
-	.bs:	db 0x08, 0x20, 0x08
-
+	.bs:	db 0x08, 0x20, 0x08 ; BS, SPC, BS
 
 ; FLOW
 
@@ -606,7 +542,7 @@ bs_out:		pspush	.bs
 		; ignore input until ')' is read
 		wordlink '(', 1 | FLAG_IMMEDIATE
 paren:		call	tochar
-		pspop	ax
+		spop	ax
 		cmp	ax, ')'
 		jne	paren
 		ret
@@ -617,98 +553,31 @@ paren:		call	tochar
 backslash:	mov	[in], buffer+64
 		ret
 
-%macro	stolit	1
-	mov	byte [di], %1
-	inc	di
-%endmacro
-
-; 		; compile-time	( -- a )
-; 		; run-time	( f -- )
-; 		wordlink 'if', 2 | FLAG_IMMEDIATE
-; if:		mov	di, [here]
-; 		stolit	0x8b		; mov ax, [bp]
-; 		stolit	0x46
-; 		stolit	0x00
-; 		stolit	0x83		; add bp, 2
-; 		stolit	0xc5
-; 		stolit	0x02
-; 		stolit	0x85		; test ax, ax
-; 		stolit	0xc0
-; 		stolit	0x74		; jz rel8
-; 		pspush	di
-; 		inc	di
-; 		mov	[here], di
-; 		ret
-; 
-; 		; compile-time	( a1 -- a2 )
-; 		; run-time	( -- )
-; 		wordlink 'else', 4 | FLAG_IMMEDIATE
-; else:		mov	di, [here]	; compile
-; 		stolit	0xeb		; jmp rel8
-; 		pspush	di
-; 		inc	di
-; 		mov	[here], di
-; 		call	swap
-; 		jmp	then		; compile rel8 to IF
-; 
-; 		; compile-time	( a -- )
-; 		; run-time	( -- )
-; 		wordlink 'then', 4 | FLAG_IMMEDIATE
-; then:		pspop	bx
-; 		mov	ax, [here]
-; 		sub	ax, bx
-; 		dec	ax
-; 		mov	[bx], al
-; 		ret
-; 
-; 		; compile-time	( -- a )
-; 		; run-time	( -- )
-; 		wordlink 'begin', 5 | FLAG_IMMEDIATE
-; begin:		mov	ax, [here]
-; 		pspush	ax
-; 		ret
-; 
-; 		wordlink 'until', 5 | FLAG_IMMEDIATE
-; until:		mov	di, [here]
-; 		stolit	0x8b		; mov ax, [bp]
-; 		stolit	0x46
-; 		stolit	0x00
-; 		stolit	0x83		; add bp, 2
-; 		stolit	0xc5
-; 		stolit	0x02
-; 		stolit	0x85		; test ax, ax
-; 		stolit	0xc0
-; 		stolit	0x74		; (short) jz xxx ; 		pspop	ax ; 		sub	ax, di
-; 		dec	ax
-; 		stosb
-; 		mov	[here], di
-; 		ret
-
-		; compile-time	( -- a )
-		; run-time	( f -- )
 		wordlink 'if', 2 | FLAG_IMMEDIATE
-if:		mov	di, [here]
-		stolit	0x8b		; mov ax, [bp]
-		stolit	0x46
-		stolit	0x00
-		stolit	0x83		; add bp, 2
-		stolit	0xc5
-		stolit	0x02
-		stolit	0x85		; test ax, ax
-		stolit	0xc0
-		stolit	0x0f		; jz rel16
-		stolit	0x84
-		pspush	di		; leave 2 byte space
+if:		spush	.if
+		call	compile_comma
+		mov	di, [here]
+		litb	0xe9		; jmp rel16
+		spush	di
 		add	di, 2
 		mov	[here], di
 		ret
+
+	.if:	spop	ax
+		test	ax, ax
+		jz	.jump
+		pop	ax
+		add	ax, 3
+		jmp	ax
+	.jump	ret
+		
 
 		; compile-time	( a1 -- a2 )
 		; run-time	( -- )
 		wordlink 'else', 4 | FLAG_IMMEDIATE
 else:		mov	di, [here]	; compile
-		stolit	0xe9		; jmp rel8
-		pspush	di
+		litb	0xe9		; jmp rel16
+		spush	di
 		add	di, 2		; leave 2 byte space
 		mov	[here], di
 		call	swap
@@ -717,7 +586,7 @@ else:		mov	di, [here]	; compile
 		; compile-time	( a -- )
 		; run-time	( -- )
 		wordlink 'then', 4 | FLAG_IMMEDIATE
-then:		pspop	bx
+then:		spop	bx
 		mov	ax, [here]
 		sub	ax, bx
 		sub	ax, 2
@@ -728,71 +597,164 @@ then:		pspop	bx
 		; run-time	( -- )
 		wordlink 'begin', 5 | FLAG_IMMEDIATE
 begin:		mov	ax, [here]
-		pspush	ax
+		spush	ax
 		ret
 
-		wordlink 'until', 5 | FLAG_IMMEDIATE
-until:		mov	di, [here]
-		stolit	0x8b		; mov ax, [bp]
-		stolit	0x46
-		stolit	0x00
-		stolit	0x83		; add bp, 2
-		stolit	0xc5
-		stolit	0x02
-		stolit	0x85		; test ax, ax
-		stolit	0xc0
-		stolit	0x0f		; jz xxx
-		stolit	0x84
-		pspop	ax
+		; compile-time	( a -- )
+		; run-time	( -- )
+		wordlink 'again', 5 | FLAG_IMMEDIATE
+again:		mov	di, [here]
+		litb	0xe9		; jmp xxx
+		spop	ax
 		sub	ax, di
 		sub	ax, 2
 		stosw
 		mov	[here], di
 		ret
 
+		; compile-time	( a -- )
+		; run-time	( f -- )
+		wordlink 'until', 5 | FLAG_IMMEDIATE
+until:		spush	.until
+		call	compile_comma
+		jmp	again
+
+	.until:	spop	ax
+		test	ax, ax
+		jz	.loop
+		pop	ax	; skip jmp rel16 (3 bytes)
+		add	ax, 3
+		jmp	ax
+	.loop	ret
+
+		; compile-time	( a -- )
+		; run-time	( R: n -- )
+		wordlink 'next', 4 | FLAG_IMMEDIATE
+next:		spush	.next
+		call	compile_comma
+		jmp	again
+
+	.next:	pop	bx
+		pop	ax
+		dec	ax
+		push	ax
+		test	ax, ax
+		jnz	.loop
+		pop	ax
+		add	bx, 3
+	.loop:	jmp	bx
+
+		; [if] ( f -- )
 		; works outside of definitions
-		; [then] cannot be nested
 		; all [if] leads to the first [then]
-		wordlink '[if]', 4 | FLAG_IMMEDIATE
-meta_if:	pspop	ax
+		wordlink '[if]', 4
+meta_if:	spop	ax
 		test	ax, ax
 		jz	.jump
 		ret
 	.jump:	call	toword
-		pspop	ax
+		spop	ax
 		cmp	ax, 6
 		je	.next
 		add	bp, 2 ; drop
 		jmp	.jump
-	.next:	pspush	.then
-		pspush	ax
+	.next:	spush	.then
+		spush	ax
 		call	scmp
-		pspop	ax
+		spop	ax
 		test	ax, ax
 		jz	.jump
 		ret
 	.then:	db '[then]'
 
+		; [then] ( -- )
+		; reference for [if], on its own does nothing
 		wordlink '[then]', 6
 meta_then:	ret
 
-
 ; SYSTEM VARIABLES
 
-		; ( -- a )
-		wordlink 'here', 4
-here_addr:	pspush	here
+; ( -- a ) currently selected block
+const 'blk>', 4, blk
+
+; ( -- a ) last word of the directionary
+const 'latest', 6, latest
+
+; ( -- a ) next available space in dictionary
+const 'here', 4, here
+
+; ( -- a ) beginning of the input buffer
+const 'in(', 3, buffer
+
+; ( -- a ) end of the input buffer
+const 'in)', 3, buffer+64
+
+; ( -- a ) current position in the input buffer
+const 'in>', 3, in
+
+; ENTRY MANAGEMENT
+
+		; ' ... ( -- w )
+		; find addr of word ..., abort if fail
+		wordlink "'", 1
+tickw:		call	toword		; ( -- sa sl )
+		call	find		; ( sa sl -- w? f )
+		spop	ax
+		test	ax, ax
+		jz	notfound
 		ret
 
-		; ( -- a )
-		wordlink 'latest', 6
-latest_addr:	pspush	latest
+		; ['] ... runtime ( -- w )
+		; similar to ' (tick)
+		; but store addr as a number literal
+		wordlink "[']", 3 | FLAG_IMMEDIATE
+tickimmd:	call	toword		; ( -- sa sl )
+		call	find		; ( sa sl -- w? f )
+		spop	ax
+		test	ax, ax
+		jz	notfound
+		call	litn		; ( w -- )
 		ret
 
-		; ( -- a )
-blk_addr:	pspush	blk
+		; forget ... ( -- )
+		; rewind the dictionary up to ...'s prev entry
+		wordlink "forget", 6
+forget:		call	toword
+		call	find
+		spop	ax
+		test	ax, ax
+		jz	notfound
+		spop	bx
+		mov	ax, [bx-3]	; next entry
+		mov	word [latest], ax
+		mov	al, [bx-1]
+		and	al, MASK_LENGTH
+		xor	ah, ah
+		sub	bx, ax
+		sub	bx, 3
+		mov	word [here], bx
 		ret
 
+; DEFINING WORDS
+
+		; value ... ( n -- )
+		; create cell ... that returns its value
+		wordlink 'value', 5
+value:		call	create
+		call	litn
+		call	exit
+		ret
+
+; doer/does:
+; alias:
+; const:
+
+; ASCII CONSTANTS
+
+const 'BS', 2, 0x08
+const 'CR', 2, 0x0d
+const 'LF', 2, 0x0a
+const 'SPC', 3, 0x20
 
 ; PARAMETER STACK
 
@@ -804,7 +766,7 @@ drop:		add	bp, 2
 		; ( a -- a a )
 		wordlink 'dup', 3
 dup:		mov	ax, [bp]
-		pspush	ax
+		spush	ax
 		ret
 
 		; ( a -- a a? )
@@ -813,12 +775,12 @@ dup:		mov	ax, [bp]
 ?dup:		mov	ax, [bp]
 		test	ax, ax
 		jz	.zero
-		pspush	ax
+		spush	ax
 	.zero:	ret
 
 		; ( a b -- b )
 		wordlink 'nip', 3
-nip:		pspop	ax
+nip:		spop	ax
 		mov	[bp], ax
 		ret
 
@@ -827,44 +789,44 @@ nip:		pspop	ax
 over:		mov	bx, bp
 		add	bx, 2
 		mov	bx, [bx]
-		pspush	bx
+		spush	bx
 		ret
 
 		; ( a b c -- b c a )
 		wordlink 'rot', 3
-rot:		pspop	ax
-		pspop	bx
+rot:		spop	ax
+		spop	bx
 		mov	cx, [bp]
 		mov	[bp], bx
-		pspush	ax
-		pspush	cx
+		spush	ax
+		spush	cx
 		ret
 
 		; ( a b c -- c a b )
 		wordlink 'nrot', 4
-nrot:		pspop	ax
-		pspop	bx
+nrot:		spop	ax
+		spop	bx
 		mov	cx, [bp]
 		mov	[bp], ax
-		pspush	cx
-		pspush	bx
+		spush	cx
+		spush	bx
 		ret
 
 		; ( a b -- b a )
 		wordlink 'swap', 4
-swap:		pspop	ax
+swap:		spop	ax
 		mov	bx, [bp]
 		mov	[bp], ax
-		pspush	bx
+		spush	bx
 		ret
 
 		; ( a b -- b a b )
 		wordlink 'tuck', 4
-tuck:		pspop	ax
+tuck:		spop	ax
 		mov	bx, [bp]
 		mov	[bp], ax
-		pspush	bx
-		pspush	ax
+		spush	bx
+		spush	ax
 		ret
 
 		; ( a a -- )
@@ -874,11 +836,11 @@ twodrop:	add	bp, 4
 
 		; ( a b -- a b a b )
 		wordlink '2dup', 4
-twodup:		pspop	ax
+twodup:		spop	ax
 		mov	bx, [bp]
 		sub	bp, 4
 		mov	[bp], bx
-		pspush	ax
+		spush	ax
 		ret
 
 
@@ -886,7 +848,7 @@ twodup:		pspop	ax
 
 		; ( n -- R:n )
 		wordlink '>r', 2
-to_r:		pspop	ax
+to_r:		spop	ax
 		pop	bx
 		push	ax
 		push	bx
@@ -897,14 +859,14 @@ to_r:		pspop	ax
 r_from:		pop	ax
 		pop	bx
 		push	ax
-		pspush	bx
+		spush	bx
 		ret
 
 		; ( R:n -- n R:n )
 		wordlink 'r@', 2
 r_fetch:	pop	ax
 		pop	bx
-		pspush	bx
+		spush	bx
 		push	bx
 		push	ax
 		ret
@@ -916,17 +878,22 @@ rdrop:		pop	ax
 		push	ax
 		ret
 
-
 ; STACK META
 
 		; .s ( -- )
 		; prints contents of the stack
-
 		wordlink '.s', 2
-
 dot_s:		call	scnt
-		pspop	cx
-		shr	cx, 1
+		call	shiftr
+
+		spush	'<'
+		call	emit
+		call	dup
+		call	dot
+		spush	'>'
+		call	emit
+
+		spop	cx
 		mov	si, 0xfefe
 		std
 
@@ -934,7 +901,7 @@ dot_s:		call	scnt
 		jz	.done
 		dec	cx
 		lodsw
-		pspush	ax
+		spush	ax
 		call	spc_out
 		call	dot
 		jmp	.next
@@ -942,26 +909,20 @@ dot_s:		call	scnt
 	.done:	cld
 		ret
 
-
 		; scnt ( -- n )
 		; size of PS in bytes
-
 		wordlink 'scnt', 4
-
 scnt:		mov	ax, 0xff00
 		sub	ax, bp
-		pspush	ax
+		spush	ax
 		ret
-
 
 		; rcnt ( -- n )
 		; size of RS in bytes
-
 		wordlink 'rcnt', 4
-
 rcnt:		mov	ax, 0x0000
 		sub	ax, sp
-		pspush	ax
+		spush	ax
 		ret
 
 
@@ -978,15 +939,15 @@ fetch:		mov	bx, [bp]
 		; ( n a -- )
 		; store n at addr a
 		wordlink '!', 1
-store:		pspop	bx
-		pspop	ax
+store:		spop	bx
+		spop	ax
 		mov	[bx], ax
 		ret
 
 		; ( n -- )
 		; write n in here and advance it
 		wordlink ',', 1
-comma:		pspop	ax
+comma:		spop	ax
 		mov	di, [here]
 		stosw
 		mov	[here], di
@@ -995,39 +956,39 @@ comma:		pspop	ax
 		; ( n a -- )
 		; increase value at addr a by n
 		wordlink '+!', 2
-plus_store:	pspop	bx
-		pspop	ax
+plus_store:	spop	bx
+		spop	ax
 		add	[bx], ax
 		ret
 
 		; ( a1 a2 u -- f )
 		; compare u bytes between a1 and a2
 		wordlink '[]=', 3
-scmp:		pspop	cx
-		pspop	si
-		pspop	di
+scmp:		spop	cx
+		spop	si
+		spop	di
 		repe	cmpsb
 		jz	.true
-		pspush	0
+		spush	0
 		ret
-	.true:	pspush	-1
+	.true:	spush	-1
 		ret
 
 		; ( c a u -- i )
 		; look for c within u bytes at addr a
 		wordlink '[c]?', 4
-c_find:		pspop	cx
-		pspop	si
-		pspop	ax
+c_find:		spop	cx
+		spop	si
+		spop	ax
 		xor	bx, bx
 	.next	cmp	[si], al
 		je	.true
 		inc	bx
 		inc	si
 		loop	.next
-		pspush	-1
+		spush	-1
 		ret
-	.true	pspush	bx
+	.true	spush	bx
 		ret
 
 		; ( a -- c )
@@ -1047,21 +1008,21 @@ c_fetch_plus:	mov	bx, [bp]
 		xor	ah, ah
 		inc	bx
 		mov	[bp], bx
-		pspush	ax
+		spush	ax
 		ret
 
 		; ( c a -- )
 		; store byte c in addr a
 		wordlink 'c!', 2
-c_store:	pspop	bx
-		pspop	ax
+c_store:	spop	bx
+		spop	ax
 		mov	[bx], al
 		ret
 
 		; ( c a -- a+1 )
 		; store byte c in addr a and inc a
 		wordlink 'c!+', 3
-c_store_plus:	pspop	bx
+c_store_plus:	spop	bx
 		mov	ax, [bp]
 		mov	[bx], al
 		inc	bx
@@ -1071,7 +1032,7 @@ c_store_plus:	pspop	bx
 		; ( c -- )
 		; store byte c in here and advance it
 		wordlink 'c,', 2
-c_comma:	pspop	ax
+c_comma:	spop	ax
 		mov	bx, [here]
 		mov	[bx], al
 		inc	bx
@@ -1081,7 +1042,7 @@ c_comma:	pspop	ax
 		; ( n -- )
 		; move here by n bytes
 		wordlink 'allot', 5
-allot:		pspop	ax
+allot:		spop	ax
 		mov	bx, [here]
 		add	bx, ax
 		mov	[here], bx
@@ -1090,7 +1051,7 @@ allot:		pspop	ax
 		; ( n -- )
 		; allot n bytes and fill with zero
 		wordlink 'allot0', 6
-allot0:		pspop	cx
+allot0:		spop	cx
 		mov	di, [here]
 		xor	ax, ax
 		rep	stosb
@@ -1100,26 +1061,26 @@ allot0:		pspop	cx
 		; ( a n c -- )
 		; fill n bytes at addr a with char c
 		wordlink 'fill', 4
-fill:		pspop	ax
-		pspop	cx
-		pspop	di
+fill:		spop	ax
+		spop	cx
+		spop	di
 		rep	stosb
 		ret
 
 		; ( a1 a2 u -- )
 		; copy u bytes from a1 to a2
 		wordlink 'move', 4
-move:		pspop	cx
-		pspop	di
-		pspop	si
+move:		spop	cx
+		spop	di
+		spop	si
 		rep	movsb
 		ret
 
 		; ( a u -- )
 		; copy u bytes from a to here
 		wordlink 'move,', 5
-move_comma:	pspop	cx
-		pspop	si
+move_comma:	spop	cx
+		spop	si
 		mov	di, [here]
 		rep	movsb
 		ret
@@ -1129,7 +1090,7 @@ move_comma:	pspop	cx
 
 		; ( a b -- a+b )
 		wordlink '+', 1
-plus:		pspop	bx
+plus:		spop	bx
 		mov	ax, [bp]
 		add	bx, ax
 		mov	[bp], bx
@@ -1137,7 +1098,7 @@ plus:		pspop	bx
 
 		; ( a b -- a-b )
 		wordlink '-', 1
-minus:		pspop	bx
+minus:		spop	bx
 		mov	ax, [bp]
 		sub	ax, bx
 		mov	[bp], ax
@@ -1145,7 +1106,7 @@ minus:		pspop	bx
 
 		; ( a b -- b-a )
 		wordlink '-^', 2
-minus_opp:	pspop	bx
+minus_opp:	spop	bx
 		mov	ax, [bp]
 		sub	bx, ax
 		mov	[bp], bx
@@ -1153,7 +1114,7 @@ minus_opp:	pspop	bx
 
 		; ( a b -- a*b )
 		wordlink '*', 1
-mul:		pspop	bx
+mul:		spop	bx
 		mov	ax, [bp]
 		mul	ax, bx
 		mov	[bp], ax
@@ -1161,7 +1122,7 @@ mul:		pspop	bx
 
 		; ( a b -- a/b )
 		wordlink '/', 1
-div:		pspop	bx
+div:		spop	bx
 		mov	ax, [bp]
 		xor	dx, dx
 		div	bx
@@ -1170,13 +1131,13 @@ div:		pspop	bx
 
 		; ( n1 n2 -- lo hi )
 		wordlink '<>', 2
-sort:		pspop	bx
+sort:		spop	bx
 		mov	ax, [bp]
 		cmp	ax, bx
 		jb	.skip
 		xchg	ax, bx
 		mov	[bp], ax
-	.skip	pspush	bx
+	.skip	spush	bx
 		ret
 
 		; ( n -- n*2 )
@@ -1223,7 +1184,7 @@ twominus:	mov	ax, [bp]
 
 		; ( n1 n2 -- hi )
 		wordlink 'max', 3
-max:		pspop	bx
+max:		spop	bx
 		mov	ax, [bp]
 		cmp	bx, ax
 		jb	.done
@@ -1232,7 +1193,7 @@ max:		pspop	bx
 
 		; ( n1 n2 -- lo )
 		wordlink 'min', 3
-min:		pspop	bx
+min:		spop	bx
 		mov	ax, [bp]
 		cmp	ax, bx
 		jb	.done
@@ -1241,7 +1202,7 @@ min:		pspop	bx
 
 		; ( a b -- a%b )
 		wordlink 'mod', 3
-mod:		pspop	bx
+mod:		spop	bx
 		mov	ax, [bp]
 		xor	dx, dx
 		div	bx
@@ -1250,17 +1211,17 @@ mod:		pspop	bx
 
 		; ( a b -- r q )
 		wordlink '/mod', 4
-divmod:		pspop	bx
+divmod:		spop	bx
 		mov	ax, [bp]
 		xor	dx, dx
 		div	bx
 		mov	[bp], dx
-		pspush	ax
+		spush	ax
 		ret
 
 		; ( a b -- a&b )
 		wordlink 'and', 3
-and:		pspop	bx
+and:		spop	bx
 		mov	ax, [bp]
 		and	ax, bx
 		mov	[bp], ax
@@ -1268,7 +1229,7 @@ and:		pspop	bx
 
 		; ( a b -- a|b )
 		wordlink 'or', 2
-or:		pspop	bx
+or:		spop	bx
 		mov	ax, [bp]
 		or	ax, bx
 		mov	[bp], ax
@@ -1276,7 +1237,7 @@ or:		pspop	bx
 
 		; ( a b -- a^b )
 		wordlink 'xor', 3
-xor:		pspop	bx
+xor:		spop	bx
 		mov	ax, [bp]
 		xor	ax, bx
 		mov	[bp], ax
@@ -1284,7 +1245,7 @@ xor:		pspop	bx
 
 		; ( n u -- n<<u )
 		wordlink 'lshift', 6
-lshift:		pspop	cx
+lshift:		spop	cx
 		mov	ax, [bp]
 		shl	ax, cx
 		mov	[bp], ax
@@ -1292,7 +1253,7 @@ lshift:		pspop	cx
 
 		; ( n u -- n>>u )
 		wordlink 'rshift', 6
-rshift:		pspop	cx
+rshift:		spop	cx
 		mov	ax, [bp]
 		shr	ax, cx
 		mov	[bp], ax
@@ -1303,7 +1264,7 @@ rshift:		pspop	cx
 
 		; = ( n1 n2 -- f )
 		wordlink '=', 1
-equ:		pspop	bx
+equ:		spop	bx
 		mov	ax, [bp]
 		mov	word [bp], 0
 		cmp	ax, bx
@@ -1313,7 +1274,7 @@ equ:		pspop	bx
 
 		; < ( n1 n2 -- f )
 		wordlink '<', 1
-lt:		pspop	bx
+lt:		spop	bx
 		mov	ax, [bp]
 		mov	word [bp], 0
 		cmp	ax, bx
@@ -1323,7 +1284,7 @@ lt:		pspop	bx
 
 		; > ( n1 n2 -- f )
 		wordlink '>', 1
-gt:		pspop	bx
+gt:		spop	bx
 		mov	ax, [bp]
 		mov	word [bp], 0
 		cmp	ax, bx
@@ -1333,7 +1294,7 @@ gt:		pspop	bx
 
 		; <= ( n1 n2 -- f )
 		wordlink '<=', 2
-lte:		pspop	bx
+lte:		spop	bx
 		mov	ax, [bp]
 		mov	word [bp], 0
 		cmp	ax, bx
@@ -1343,7 +1304,7 @@ lte:		pspop	bx
 
 		; >= ( n1 n2 -- f )
 		wordlink '>=', 2
-gte:		pspop	bx
+gte:		spop	bx
 		mov	ax, [bp]
 		mov	word [bp], 0
 		cmp	ax, bx
@@ -1379,65 +1340,31 @@ not:		not	word [bp]
 
 		; compile-time	( xxx" -- )
 		wordlink 's"', 2 | FLAG_IMMEDIATE
-squote:	mov	di, [here]
-		stolit	0xe9		; near jmp
+squote: mov	di, [here]
+		litb	0xe9		; near jmp
 		mov	ax, di		; rel16
 		add	di, 2
-		pspush	di		; sa
-		pspush	ax		; rel16
+		spush	di		; sa
+		spush	ax		; rel16
 		xor	cx, cx
 	.next:	call	tochar
-		pspop	ax
+		spop	ax
 		xor	ah, ah
 		cmp	al, 34
 		je	.done
 		stosb
 		inc	cx
 		jmp	.next
-	.done:	pspop	bx
+	.done:	spop	bx
 		mov	ax, di
 		sub	ax, bx
 		sub	ax, 2
 		mov	[bx], ax	; fill rel16 above
 		mov	[here], di	; store as literals
 		call	litn
-		pspush	cx
+		spush	cx
 		call	litn
 		ret
-
-; 		; compile-time	( xxx" -- )
-; 		wordlink 's"', 2 | FLAG_IMMEDIATE
-; squote:		mov	di, [here]
-; 		mov	[di], 0xe9 ; 16bit jmp
-; 		inc	di
-; 		mov	[.ra], di
-; 		add	di, 2
-; 		mov	[.sa], di
-; 		xor	cx, cx
-; 	.next:	call	tochar
-; 		pspop	ax
-; 		cmp	al, 34 ; '"'
-; 		je	.done
-; 		stosb
-; 		inc	cx
-; 		jmp	.next
-; 	.done:	mov	ax, di
-; 		mov	bx, [.ra]
-; 		sub	ax, bx
-; 		sub	ax, 2
-; 		mov	[bx], ax
-; 		mov	[here], di
-; 		mov	ax, [.sa]
-; 		pspush	ax
-; 		call	litn
-; 		pspush	cx
-; 		call	litn
-; 		ret
-; 
-; 	.ra:	dw	0
-; 	.sa:	dw	0
-; 	.sl:	dw	0
-
 
 
 ; NUMBER FORMATTING
@@ -1445,7 +1372,7 @@ squote:	mov	di, [here]
 		; . ( n -- )
 		; print n in its unsigned decimal form
 		wordlink 'u.', 2
-udot:		pspop	ax
+udot:		spop	ax
 	digit:	xor	dx, dx
 		mov	bx, 10
 		div	bx
@@ -1457,7 +1384,7 @@ udot:		pspop	ax
 	.zero:	push	ax
 		mov	al, dl
 		add	al, '0'
-		pspush	ax
+		spush	ax
 		call	emit
 		pop	ax
 		ret
@@ -1465,53 +1392,132 @@ udot:		pspop	ax
 		; ( n -- )
 		; print n in its signed decimal form
 		wordlink '.', 1
-dot:		pspop	ax
+dot:		spop	ax
 		test	ax, ax	; sign?
 		jns	digit
 		neg	ax
 		push	ax
-		pspush	'-'
+		spush	'-'
 		call	emit
 		pop	ax
 		jmp	digit
 
 		; ( n -- )
-		wordlink '.x', 2
-dotx:		pspop	ax
-		mov	ah, al
-		shr	ah, 4
-
+		; print n in hex form as a nibble
+		wordlink '.h', 2
+doth:		spop	ax
+		and	al, 0x0f ; mask for the first byte
 		cmp	al, 10
-		jb	.numb1
-		add	al, 'A'
-		jmp	.skip1
-	.numb1:	add	al, '0'
-
-	.skip1:	cmp	ah, 10
-		jb	.numb2
-		add	ah, 'A'
-		jmp	.skip2
-	.numb2:	add	ah, '0'
-
-	.skip2:	xor	bh, bh
-		mov	bl, ah
-		pspush	bx
-		call	emit
-		mov	bl, al
-		pspush	bx
-		call	emit
+		jb	.digit
+		add	al, 0x37-'0'
+	.digit:	add	al, '0'
+		mov	ah, 0x0e
+		int	0x10
 		ret
-		
 
+		; ( n -- )
+		; print n in hex form as a byte
+		wordlink '.x', 2
+dotx:		call	dup
+		spush	4
+		call	rshift
+		call	doth
+		call	doth
+		ret
 
-		wordlast 'nop', 3
-nop:		ret
+		; ( n -- )
+		; print n in hex form as a word
+		wordlink '.X', 2
+dotX:		call	dup
+		spush	8
+		call	rshift
+		call	dotx
+		call	dotx
+		ret
 
+; 		; ( n a -- sa sl )
+; 		; format n as decimal in memory
+; 		wordlink 'fmtd', 2
+; fmtd:		ret
+; 
+; 		; ( n a -- sa sl )
+; 		; format n's LSB as hex in memory
+; 		wordlink 'fmtx', 2
+; fmtx:		ret
+; 
+; 		; ( n a -- sa sl )
+; 		; format n as hex in memory
+; 		wordlink 'fmtX', 2
+; fmtx:		ret
 
-%macro line 1
-	%strlen __len %1
-	db %1
-	times (64 - __len) db 32
-%endmacro
+; I/O
 
-end:		db 237
+		; ( ..." -- )
+		; write ... to here
+		wordlink ',"', 2 | FLAG_IMMEDIATE
+commaquote:	mov	di, [here]
+	.next:	call	tochar
+		spop	ax
+		cmp	ax, '"'
+		je	.done
+		stosb
+		jmp	.next
+	.done:	mov	[here], di
+		ret
+
+		; ( ..." -- )
+		; print ... during runtime
+		wordlink '."', 2 | FLAG_IMMEDIATE
+dotquote:	call	squote		; ( -- sa sl )
+		spush	type
+		call	compile_comma
+		ret
+
+		; ( a -- )
+		; emit line at addr a
+		wordlink 'emitln', 6
+emitln:		spush	64
+		call	type
+		ret
+
+		; ( -- c? f )
+		; polls the keyboard for a key
+		wordlink 'key?', 4
+key?:		mov	ah, 0x01
+		int	0x16
+		jz	.nokey
+		mov	ah, 0x00 ; remove key from input buffer
+		int	0x16
+		spush	ax
+		spush	-1
+		ret
+	.nokey	spush	0
+		ret
+
+		; ( sa sl -- )
+		; call word until we get matching string
+		wordlink 'waitw', 5
+waitw:		ret
+
+		; ( h l -- )
+		; wait in microseconds (double number)
+		wordlink 'usleep', 6
+usleep:		mov	ah, 0x86
+		spop	dx	; lower order
+		spop	cx	; higher order
+		int	0x15	; cx:dx wait
+		ret
+
+		; ( -- h l )
+		; return current system clock counter
+		wordlink 'tick', 4
+tick:		xor	ah, ah
+		int	0x1a
+		spush	cx	; higher order 
+		spush	dx	; lower order 
+		ret		; higher order at cx
+
+		wordlink 'noop', 4
+noop:		ret
+
+end:

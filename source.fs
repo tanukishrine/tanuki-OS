@@ -1,17 +1,15 @@
-: .h $f and dup 10 < if '0' else $37 then + emit ; \ nibble
-: .x dup 4 rshift .h .h ; \ byte
-: .X dup 8 rshift .x .x ; \ word
-
-: ' word find drop ; : ['] ' ; immediate
 : [compile] ' compile, ; immediate
 : postpone ' litn [ ' compile, litn ] compile, ; immediate
-: ." [compile] s" postpone stype ; immediate
+: >r? r> r> rot >r >r >r ;  ( a R: b -- R: a b )
+: r>? r> r> r> nrot >r >r ; ( R: a b -- a R: b )
+: dump ( n a -- ) $fff0 and swap >r begin nl> dup .X ." : "
+  8 >r begin dup @ .X spc> dup c@ >r? 1+ dup c@ >r? 1+ next
+  16 >r begin r>? next ." | " 16 >r begin dup $20 < if drop '.'
+  then emit next next drop ;
+: memused here @ $500 - ; : memfree $7bff memused - ;
+: memstat
+  memused 1000 / . ." kB used " memfree 1000 / . ." kB free" ;
 
-: .ki ( n -- ) 10 rshift . ; \ kibi
-: memused here @ $7e00 - ; : memfree $7fff memused - ;
-: .memstat memused .ki ." KiB used " memfree .ki ." KiB free" ;
-
-here @ ] s" Welcome to TANUKI OS" stype ; execute
-nl> .memstat
+here @ ," Welcome to TANUKI OS" 20 type nl> memstat
 
 quit
