@@ -349,7 +349,7 @@ parse:		spop	cx
 
 		; negative decimal
 	.neg:	lodsb
-		mul	bx, 10
+		imul	bx, 10
 		sub	al, '0'
 		jb	.nan
 		cmp	al, 10
@@ -360,7 +360,7 @@ parse:		spop	cx
 
 		; unsigned decimal
 	.pos:	lodsb
-		mul	bx, 10
+		imul	bx, 10
 	.skip:	sub	al, '0'
 		jb	.nan
 		cmp	al, 10
@@ -555,7 +555,7 @@ paren:		call	tochar
 		; ( -- )
 		; ignore input until end of line
 		wordlink '\', 1 | FLAG_IMMEDIATE
-backslash:	mov	[in], buffer+64
+backslash:	mov	word [in], buffer+64
 		ret
 
 		wordlink 'if', 2 | FLAG_IMMEDIATE
@@ -1182,7 +1182,7 @@ minus_opp:	spop	bx
 		wordlink '*', 1
 mul:		spop	bx
 		mov	ax, [bp]
-		mul	ax, bx
+		imul	ax, bx
 		mov	[bp], ax
 		ret
 
@@ -1323,7 +1323,7 @@ xor:		spop	bx
 		wordlink 'lshift', 6
 lshift:		spop	cx
 		mov	ax, [bp]
-		shl	ax, cx
+		shl	ax, cl
 		mov	[bp], ax
 		ret
 
@@ -1331,7 +1331,7 @@ lshift:		spop	cx
 		wordlink 'rshift', 6
 rshift:		spop	cx
 		mov	ax, [bp]
-		shr	ax, cx
+		shr	ax, cl
 		mov	[bp], ax
 		ret
 
