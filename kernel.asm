@@ -1,6 +1,7 @@
 BITS 16
 org 0x0500
 
+; dx = A register
 ; bp = PSP (parameter stack pointer)
 ; sp = RSP (return stack pointer) ; FORTH MACROS
 
@@ -55,8 +56,7 @@ org 0x0500
 	ret
 %endmacro
 
-start:		
-		mov	bp, 0xff00	; initialize SP
+start:		mov	bp, 0xff00	; initialize SP
 		mov	sp, 0x0000	; initialize RS
 		jmp	interpret
 
@@ -76,7 +76,7 @@ curlen:		db 0	; current word len
 blk:		dw 0x7e00	; pointer to current line
 line:		dw 16*3		; number of lines to read
 
-; DICTIONARY
+; THE DICTIONARY
 		; key ( -- c )
 		; fetch char c from direct input
 		wordinit 'key', 3
@@ -164,6 +164,16 @@ notfound:	call	nl_out		; ( -- )
 		jmp	abort
 
 	.err:	db ' word not found'
+
+notnumber:	call	nl_out
+		call	curword
+		call	type
+		spush	.err		; ( -- sa )
+		spush	13		; ( -- sa sl )
+		call	type		; ( sa sl -- )
+		jmp	abort
+
+	.err:	db ' not a number'
 
 underflow:	spush	.err		; ( -- sa )
 		spush	21		; ( -- sa sl )
@@ -378,25 +388,43 @@ parse:		spop	cx
 		; lit ( -- n ) runtime
 		wordlink 'lit', 3
 lit:		pop	si
-		lodsw
-		spush	ax
+		mov	word di, [si]
+		add	si, 2
+		spush	di
 		push	si
 		ret
-
 
 		; litn ( n -- )
 		; compile n as a literal
 		wordlink 'litn', 4
 litn:		mov	di, [here]
-		litb	0xe8
-		mov	ax, lit		; relative addressing
-		sub	ax, di
-		sub	ax, 2
-		stosw
-		spop	ax		; store n
-		stosw
+		mov	byte [di], 0xe8
+		inc	di
+		mov	si, lit		; relative addressing
+		sub	si, di
+		sub	si, 2
+		mov	word [di], si
+		add	di, 2
+		spop	si		; store n
+		mov	word [di], si
+		add	di, 2
 		mov	[here], di
 		ret
+
+; 		wordlink 'litn', 4
+; litn:		mov	di, [here]
+; 		litb	0x83		; sub bp, 2
+; 		litb	0xed
+; 		litb	0x02
+; 		litb	0xc7		; mov [bp], imm16
+; 		litb	0x46
+; 		litb	0x00
+; 		mov	word si, [bp]
+; 		mov	[di], si
+; 		add	di, 2
+; 		add	bp, 2
+; 		mov	[here], di
+; 		ret
 
 		; find ( sa sl -- w? f )
 		; search for counted string in dictionary
@@ -558,6 +586,14 @@ paren:		call	tochar
 backslash:	mov	word [in], buffer+64
 		ret
 
+		; abort" ..." ( -- )
+		; compiles a ." followed by an abort"
+		wordlink 'abort"', 6 | FLAG_IMMEDIATE
+abort_quote:	call	dot_quote
+		spush	abort
+		call	compile_comma
+		ret
+
 		wordlink 'if', 2 | FLAG_IMMEDIATE
 if:		spush	.if
 		call	compile_comma
@@ -649,6 +685,15 @@ next:		spush	.next
 		add	bx, 3
 	.loop:	jmp	bx
 
+		; leave ( -- )
+		; in a begin..next loop, exit at the next jump
+		wordlink 'leave', 5
+leave:		pop	bx
+		pop	ax
+		push	1
+		push	bx
+		ret
+
 		; [if] ( f -- )
 		; works outside of definitions
 		; all [if] leads to the first [then]
@@ -676,6 +721,7 @@ meta_if:	spop	ax
 		; reference for [if], on its own does nothing
 		wordlink '[then]', 6
 meta_then:	ret
+		
 
 ; SYSTEM VARIABLES
 
@@ -702,6 +748,17 @@ const 'in>', 3, in
 
 ; ENTRY MANAGEMENT
 
+		; '? ... ( -- f )
+		; find ... in dictionary, return true if found
+		wordlink "'?", 2
+tick?:		call	toword		; ( -- sa sl )
+		call	find		; ( sa sl -- w? f )
+		mov	ax, [bp]
+		test	ax, ax
+		jz	.done
+		call	nip
+	.done:	ret
+
 		; ' ... ( -- w )
 		; find addr of word ..., abort if fail
 		wordlink "'", 1
@@ -713,10 +770,9 @@ tickw:		call	toword		; ( -- sa sl )
 		ret
 
 		; ['] ... runtime ( -- w )
-		; similar to ' (tick)
-		; but store addr as a number literal
+		; similar to "'", but store addr as a literal
 		wordlink "[']", 3 | FLAG_IMMEDIATE
-tickimmd:	call	toword		; ( -- sa sl )
+tickimm:	call	toword		; ( -- sa sl )
 		call	find		; ( sa sl -- w? f )
 		spop	ax
 		test	ax, ax
@@ -725,7 +781,7 @@ tickimmd:	call	toword		; ( -- sa sl )
 		ret
 
 		; forget ... ( -- )
-		; rewind the dictionary up to ...'s prev entry
+		; rewind dict up to ...'s prev entry
 		wordlink "forget", 6
 forget:		call	toword
 		call	find
@@ -774,7 +830,8 @@ to_value:	call	toword
 		mov	[bx], ax
 		ret
 
-		; alias ... ( x y -- )
+		; alias x y ( -- )
+		; define an alias y to x
 		wordlink 'alias', 5
 alias:		call	toword
 		call	find
@@ -791,35 +848,20 @@ alias:		call	toword
 		mov	[here], di
 		ret
 
-; TO BE IMPLEMENTED
-		; doer ( -- )
-		wordlink 'doer', 4
-doer:		call	create
-		mov	di, [here]
-		litb	0xe9		; jmp rel16
-		add	di, 2
-		mov	[here], di
-		spush	di
+		; [compile] ... ( -- )
+		; compile word ... and write it to here
+		wordlink '[compile]', 9 | FLAG_IMMEDIATE
+compile_imm:	call	tickw
+		call	compile_comma
 		ret
 
-; TO BE IMPLEMENTED
-		; does> ( -- )
-		wordlink 'does', 4
-does:		mov	ax, [here]
-		mov	bx, [latest]
-		sub	ax, bx
-		sub	ax, 3
-		inc	bx
-		mov	[bx], ax
-		call	exit
-		ret
 
 ; ASCII CONSTANTS
 
-const 'BS', 2, 0x08
-const 'CR', 2, 0x0d
-const 'LF', 2, 0x0a
-const 'SPC', 3, 0x20
+const 'BS', 2, 0x08	; backspace
+const 'CR', 2, 0x0d	; carriage return
+const 'LF', 2, 0x0a	; line feed
+const 'SPC', 3, 0x20	; space character
 
 ; PARAMETER STACK
 
@@ -1151,6 +1193,72 @@ move_comma:	spop	cx
 		mov	[here], di
 		ret
 
+; A REGISTER
+
+		; ( n -- A:n )
+		wordlink '>a', 2
+to_a:		spop dx
+		ret
+
+		; ( A:n -- n )
+		wordlink 'a>', 2
+a_from:		spush dx
+		ret
+
+		; ( R:n -- A:n )
+		wordlink 'r>a', 3
+r_to_a:		pop	ax
+		pop	dx
+		jmp	ax
+
+		; ( A:n -- R:n )
+		wordlink 'a>r', 3
+a_to_r:		pop	ax
+		push	dx
+		jmp	ax
+
+		; ( A:n -- A:n+1 )
+		wordlink 'a+', 2
+a_inc:		inc dx
+		ret
+
+		; ( A:n -- A:n-1 )
+		wordlink 'a-', 2
+a_dec:		dec dx
+		ret
+
+		; ( A:a -- c A:a )
+		wordlink 'ac@', 3
+a_cfetch:	mov	bx, dx
+		mov	bl, [bx]
+		xor	bh, bh
+		spush	bx
+		ret
+
+		; ( c A:a -- A:a )
+		wordlink 'ac!', 3
+a_cstore:	spop	ax
+		mov	bx, dx
+		mov	[bx], al
+		ret
+
+		; ( A:a -- c A:a+1 )
+		wordlink 'ac@+', 4
+a_cfetchplus:	mov	bx, dx
+		inc	dx
+		mov	bl, [bx]
+		xor	bh, bh
+		spush	bx
+		ret
+
+		; ( c A:a -- A:a+1 )
+		wordlink 'ac!+', 4
+a_cstoreplus:	spop	ax
+		mov	bx, dx
+		inc	dx
+		mov	[bx], al
+		ret
+
 
 ; ARITHMETIC / BITS
 
@@ -1220,13 +1328,27 @@ shiftr:		mov	ax, [bp]
 		mov	[bp], ax
 		ret
 
-		; ( n -- lsb msb )
-		wordlink 'L|M', 3
+		; ( n -- n<<8 )
+		wordlink 'l>m', 3
+shiftl8:	mov	ax, [bp]
+		shl	ax, 8
+		mov	[bp], ax
+		ret
+
+		; ( n -- n>>8 )
+		wordlink 'm>l', 3
+shiftr8:	mov	ax, [bp]
+		shr	ax, 8
+		mov	[bp], ax
+		ret
+
+		; ( n -- msb lsb )
+		wordlink 'm|l', 3
 bytesplit:	spop	ax
 		xor	bx, bx
-		mov	bl, al
-		spush	bx
 		mov	bl, ah
+		spush	bx
+		mov	bl, al
 		spush	bx
 		ret
 
@@ -1478,10 +1600,8 @@ dot:		spop	ax
 		pop	ax
 		jmp	digit
 
-; REMOV DOT_H FROM VIEW
 		; ( n -- )
 		; print n in hex form as a nibble
-		wordlink '.h', 2
 doth:		spop	ax
 		and	al, 0x0f ; mask for the first byte
 		cmp	al, 10
@@ -1512,27 +1632,12 @@ dotX:		call	dup
 		call	dotx
 		ret
 
-; 		; ( n a -- sa sl )
-; 		; format n as decimal in memory
-; 		wordlink 'fmtd', 2
-; fmtd:		ret
-; 
-; 		; ( n a -- sa sl )
-; 		; format n's LSB as hex in memory
-; 		wordlink 'fmtx', 2
-; fmtx:		ret
-; 
-; 		; ( n a -- sa sl )
-; 		; format n as hex in memory
-; 		wordlink 'fmtX', 2
-; fmtx:		ret
-
 ; I/O
 
 		; ( ..." -- )
 		; write ... to here
 		wordlink ',"', 2 | FLAG_IMMEDIATE
-commaquote:	mov	di, [here]
+comma_quote:	mov	di, [here]
 	.next:	call	tochar
 		spop	ax
 		cmp	ax, '"'
@@ -1545,7 +1650,7 @@ commaquote:	mov	di, [here]
 		; ( ..." -- )
 		; print ... during runtime
 		wordlink '."', 2 | FLAG_IMMEDIATE
-dotquote:	call	squote		; ( -- sa sl )
+dot_quote:	call	squote		; ( -- sa sl )
 		spush	type
 		call	compile_comma
 		ret
@@ -1571,10 +1676,97 @@ key?:		mov	ah, 0x01
 	.nokey	spush	0
 		ret
 
-		; ( sa sl -- )
-		; call word until we get matching string
-		wordlink 'waitw', 5
-waitw:		ret
+; BIOS INTERRUPTh
+
+; BROKEN
+		; int <num> ( -- ) compile-only
+		wordlink 'int', 3 | FLAG_IMMEDIATE
+int:		call	toword		; ( -- sa sl )
+		call	parse		; ( sa sl -- n? f )
+		spop	ax
+		test	ax, ax
+		jz	notnumber
+		mov	di, [here]
+		litb	0xcd ; int opcode
+		spop	ax
+		stosb
+		mov	[here], di
+		ret
+
+		; int10h
+		wordlink 'int10h', 6
+int10h:		int	10h
+		ret
+
+		; ( ax -- )
+		wordlink '>ax', 3
+to_ax:		spop	ax
+		ret
+
+		; ( bx -- )
+		wordlink '>bx', 3
+to_bx:		spop	bx
+		ret
+
+		; ( cx -- )
+		wordlink '>cx', 3
+to_cx:		spop	cx
+		ret
+
+		; ( dx -- )
+		wordlink '>dx', 3
+to_dx:		spop	dx
+		ret
+
+		; ( -- ax )
+		wordlink 'ax>', 3
+ax_from:	spush	ax
+		ret
+
+		; ( -- bx )
+		wordlink 'bx>', 3
+bx_from:	spush	bx
+		ret
+
+		; ( -- cx )
+		wordlink 'cx>', 3
+cx_from:	spush	cx
+		ret
+
+		; ( -- dx )
+		wordlink 'dx>', 3
+dx_from:	spush	dx
+		ret
+
+		; ( -- f )
+		wordlink 'flags>', 6
+f_from:		pushf
+		pop	ax
+		spush	ax
+		ret
+
+; | Bit | Mask  | Meaning               |
+; |-----|-------|-----------------------|
+; |   0 | 0001h | CF – Carry            |
+; |   2 | 0004h | PF – Parity           |
+; |   4 | 0010h | AF – Aux carry        |
+; |   6 | 0040h | ZF – Zero             |
+; |   7 | 0080h | SF – Sign             |
+; |   9 | 0200h | IF – Interrupt Enable |
+; |  10 | 0400h | DF – Direction        |
+; |  11 | 0800h | OF – Overflow         |
+
+
+; OTHER
+
+		; ( -- h l )
+		; return current system clock counter
+		wordlink 'ticks', 5
+ticks:		xor	ah, ah
+		int	0x1a
+		spush	cx	; higher order 
+		spush	dx	; lower order 
+		ret		; higher order at cx
 
 		; ( h l -- )
 		; wait in microseconds (double number)
@@ -1585,48 +1777,8 @@ usleep:		mov	ah, 0x86
 		int	0x15	; cx:dx wait
 		ret
 
-		; ( -- h l )
-		; return current system clock counter
-		wordlink 'tick', 4
-tick:		xor	ah, ah
-		int	0x1a
-		spush	cx	; higher order 
-		spush	dx	; lower order 
-		ret		; higher order at cx
-
-		; ( sector addr -- )
-		wordlink 'read', 4
-read:		spop	bx	; add of destination
-		spop	cx	; cylinder|sector number
-		mov	ah, 02	; BIOS read disk sectors
-		mov	al, 2	; number of sectors to read
-		mov	dh, 0	; head number
-		mov	dl, [BOOTDRIVE]
-		int	13h
-		jnc	disk_ok
-		jmp	disk_err
-
-		; ( addr sector -- )
-		wordlink 'write', 5
-write:		spop	cx	; cylinder|sector number
-		spop	bx	; addr of source
-		mov	ah, 03	; BIOS write disk sectors
-		mov	al, 2	; number of sectors to write
-		mov	dh, 0	; head number
-		mov	dl, [BOOTDRIVE]
-		int	13h
-		jc	disk_err
-
-disk_ok:	spush	-1
-		ret
-disk_err:	spush	0
-		ret
-
-		; ( -- )
-		wordlink 'page', 4
-page:		mov	ax, 0x0003
-		int	10h
-		ret
+		wordlink 'reboot', 6
+boot:		int	19h
 
 		wordlink 'noop', 4
 noop:		ret
